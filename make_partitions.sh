@@ -101,11 +101,6 @@ if [[ $UNALLOCATED_SECTORS -gt 1000000 ]]; then
     CURRENT_END=$(echo "$PART_INFO" | grep "Last sector:" | awk '{print $3}')
     echo "Current APP partition: start=$PART_START, end=$CURRENT_END"
     
-    # Get the partition type and name from DESTINATION (already copied from source)
-    PART_NAME=$(echo "$PART_INFO" | grep "Partition name:" | sed "s/Partition name: '\(.*\)'/\1/")
-    PART_TYPE=$(echo "$PART_INFO" | grep "Partition GUID code:" | awk '{print $4}')
-    echo "Partition name: '$PART_NAME', Type: $PART_TYPE"
-    
     # Calculate new end sector - simply extend to use 90% of unallocated space
     NEW_END=$((CURRENT_END + SECTORS_TO_ADD))
     
@@ -114,18 +109,27 @@ if [[ $UNALLOCATED_SECTORS -gt 1000000 ]]; then
     if [[ $NEW_END -gt $MAX_END ]]; then
         NEW_END=$MAX_END
     fi
-    echo "New APP partition end sector: $NEW_END"
     
-    # Use sgdisk --delete and --new in a SINGLE command to avoid partition table issues
-    # This ensures the partition number stays the same
-    echo "Expanding partition $APP_PART_NUM..."
+    # Calculate new size in sectors
+    NEW_SIZE=$((NEW_END - PART_START + 1))
+    echo "New APP partition end sector: $NEW_END (size: $NEW_SIZE sectors)"
+    
+    # Use sfdisk to resize the partition in place (doesn't require delete/recreate)
+    # sfdisk can modify a single partition without touching others
+    echo "Expanding partition $APP_PART_NUM using sfdisk..."
     echo "  Start: $PART_START (unchanged), End: $NEW_END (was $CURRENT_END)"
     
-    sgdisk --delete="$APP_PART_NUM" \
-           --new="${APP_PART_NUM}:${PART_START}:${NEW_END}" \
-           --typecode="${APP_PART_NUM}:${PART_TYPE}" \
-           --change-name="${APP_PART_NUM}:${PART_NAME}" \
-           "$DESTINATION" || { echo "Failed to expand partition $APP_PART_NUM."; exit 1; }
+    # Create sfdisk script to resize just this partition
+    # Format: <start>, <size>, <type>, <bootable>
+    # Using partition number with comma syntax tells sfdisk to modify that specific partition
+    echo ", +${SECTORS_TO_ADD}" | sfdisk --no-reread -N "$APP_PART_NUM" "$DESTINATION" || {
+        echo "sfdisk resize failed, trying alternative method with parted..."
+        # Fallback to parted if sfdisk fails
+        parted -s "$DESTINATION" resizepart "$APP_PART_NUM" "${NEW_END}s" || {
+            echo "Failed to expand partition $APP_PART_NUM."
+            exit 1
+        }
+    }
     
     # Calculate actual expansion
     ACTUAL_EXPANSION=$((NEW_END - CURRENT_END))
