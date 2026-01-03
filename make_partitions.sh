@@ -103,8 +103,12 @@ echo "Creating partitions on $DESTINATION with expanded APP partition..."
 echo "All partitions after APP will be shifted by $SECTORS_TO_ADD sectors"
 echo ""
 
-# Get list of all partitions from source, sorted by partition number
-PARTITIONS=$(sgdisk -p "$SOURCE" | grep -E "^ *[0-9]+" | awk '{print $1}' | sort -n)
+# Get list of all partitions from source, sorted by start sector to maintain order
+# We need to create them in order of their position on disk
+PARTITIONS=$(sgdisk -p "$SOURCE" | grep -E "^ *[0-9]+" | sort -k2 -n | awk '{print $1}')
+
+# Track the next available sector for creating partitions
+NEXT_SECTOR=40  # Start after GPT header
 
 for PART_NUM in $PARTITIONS; do
     # Get partition info from source
@@ -114,23 +118,39 @@ for PART_NUM in $PARTITIONS; do
     PART_TYPE=$(echo "$PART_INFO" | grep "Partition GUID code:" | awk '{print $4}')
     PART_NAME=$(echo "$PART_INFO" | grep "Partition name:" | sed "s/Partition name: '\(.*\)'/\1/")
     
+    # Calculate original partition size
+    PART_SIZE=$((PART_END - PART_START + 1))
+    
     if [[ "$PART_NUM" -eq "$APP_PART_NUM" ]]; then
         # This is the APP partition - create it with expanded size
         NEW_START=$PART_START
-        NEW_END=$NEW_APP_END
-        echo "Creating partition $PART_NUM (APP - EXPANDED): start=$NEW_START, end=$NEW_END"
+        NEW_SIZE=$((PART_SIZE + SECTORS_TO_ADD))
+        NEW_END=$((NEW_START + NEW_SIZE - 1))
+        NEW_SIZE_GB=$((NEW_SIZE * 512 / 1024 / 1024 / 1024))
+        echo "Creating partition $PART_NUM (APP - EXPANDED): start=$NEW_START, size=$NEW_SIZE (~${NEW_SIZE_GB}GB)"
+        NEXT_SECTOR=$((NEW_END + 1))
     else
-        # This is another partition - shift it by the amount we expanded APP
-        NEW_START=$((PART_START + SECTORS_TO_ADD))
-        NEW_END=$((PART_END + SECTORS_TO_ADD))
-        echo "Creating partition $PART_NUM ($PART_NAME): start=$NEW_START, end=$NEW_END (shifted +$SECTORS_TO_ADD)"
+        # This is another partition - place it after the previous one
+        # Use 0 for start to let sgdisk find the next available aligned sector
+        # Use +SIZE format to specify size instead of end sector
+        NEW_SIZE_SECTORS=$PART_SIZE
+        PART_SIZE_KB=$((PART_SIZE * 512 / 1024))
+        echo "Creating partition $PART_NUM ($PART_NAME): size=$PART_SIZE sectors (~${PART_SIZE_KB}KB)"
     fi
     
-    # Create the partition
-    sgdisk -n "${PART_NUM}:${NEW_START}:${NEW_END}" \
-           -t "${PART_NUM}:${PART_TYPE}" \
-           -c "${PART_NUM}:${PART_NAME}" \
-           "$DESTINATION" || { echo "Failed to create partition $PART_NUM"; exit 1; }
+    if [[ "$PART_NUM" -eq "$APP_PART_NUM" ]]; then
+        # For APP, specify exact start and end
+        sgdisk -n "${PART_NUM}:${NEW_START}:${NEW_END}" \
+               -t "${PART_NUM}:${PART_TYPE}" \
+               -c "${PART_NUM}:${PART_NAME}" \
+               "$DESTINATION" || { echo "Failed to create partition $PART_NUM"; exit 1; }
+    else
+        # For other partitions, use 0 for start (next available) and +size format
+        sgdisk -n "${PART_NUM}:0:+${PART_SIZE}" \
+               -t "${PART_NUM}:${PART_TYPE}" \
+               -c "${PART_NUM}:${PART_NAME}" \
+               "$DESTINATION" || { echo "Failed to create partition $PART_NUM"; exit 1; }
+    fi
 done
 
 echo ""
