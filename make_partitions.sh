@@ -52,108 +52,101 @@ fi
 echo "Clearing all partition and filesystem metadata from $DESTINATION..."
 sgdisk --zap-all "$DESTINATION" || { echo "Failed to zap $DESTINATION."; exit 1; }
 
-# Backup the GPT partition table from the source disk
-echo "Backing up partition table from $SOURCE..."
-sgdisk --backup=table.bak "$SOURCE" || { echo "Failed to backup partition table from $SOURCE."; exit 1; }
+# Get total disk size in sectors for destination
+DEST_TOTAL_SECTORS=$(blockdev --getsz "$DESTINATION")
+echo "Destination disk total sectors: $DEST_TOTAL_SECTORS"
 
-# Restore the partition table to the destination disk
-echo "Restoring partition table to $DESTINATION..."
-sgdisk --load-backup=table.bak "$DESTINATION" || { echo "Failed to restore partition table to $DESTINATION."; exit 1; }
+# Get total used sectors from source (end of last partition)
+SOURCE_LAST_SECTOR=$(sgdisk -p "$SOURCE" | grep -E "^ *[0-9]+" | awk '{print $3}' | sort -n | tail -1)
+echo "Source last used sector: $SOURCE_LAST_SECTOR"
+
+# Calculate unallocated space on destination (reserve 34 sectors for backup GPT)
+UNALLOCATED_SECTORS=$((DEST_TOTAL_SECTORS - SOURCE_LAST_SECTOR - 34))
+echo "Unallocated sectors on destination: $UNALLOCATED_SECTORS"
+
+# Calculate 90% of unallocated space to add to APP partition
+if [[ $UNALLOCATED_SECTORS -gt 1000000 ]]; then
+    SECTORS_TO_ADD=$((UNALLOCATED_SECTORS * 90 / 100))
+    EXTRA_GB=$((SECTORS_TO_ADD * 512 / 1024 / 1024 / 1024))
+    echo "Will add $SECTORS_TO_ADD sectors (~${EXTRA_GB}GB) to APP partition"
+else
+    SECTORS_TO_ADD=0
+    echo "Not enough unallocated space to expand APP partition"
+fi
+
+# Find the APP partition number and get its info from source
+APP_PART_NUM=$(sgdisk -p "$SOURCE" | grep -i "APP" | awk '{print $1}' | head -1)
+if [[ -z "$APP_PART_NUM" ]]; then
+    APP_PART_NUM=1  # Default to partition 1 if APP not found by name
+fi
+echo "APP partition number: $APP_PART_NUM"
+
+# Get APP partition info from source
+APP_INFO=$(sgdisk -i "$APP_PART_NUM" "$SOURCE")
+APP_START=$(echo "$APP_INFO" | grep "First sector:" | awk '{print $3}')
+APP_END=$(echo "$APP_INFO" | grep "Last sector:" | awk '{print $3}')
+APP_TYPE=$(echo "$APP_INFO" | grep "Partition GUID code:" | awk '{print $4}')
+APP_NAME=$(echo "$APP_INFO" | grep "Partition name:" | sed "s/Partition name: '\(.*\)'/\1/")
+APP_SIZE=$((APP_END - APP_START + 1))
+
+echo "Source APP partition: start=$APP_START, end=$APP_END, size=$APP_SIZE sectors"
+
+# Calculate new APP end sector (expanded)
+NEW_APP_END=$((APP_END + SECTORS_TO_ADD))
+NEW_APP_SIZE=$((NEW_APP_END - APP_START + 1))
+NEW_APP_SIZE_GB=$((NEW_APP_SIZE * 512 / 1024 / 1024 / 1024))
+echo "New APP partition will be: start=$APP_START, end=$NEW_APP_END, size ~${NEW_APP_SIZE_GB}GB"
+
+# Now create all partitions on destination with APP expanded and others shifted
+echo ""
+echo "Creating partitions on $DESTINATION with expanded APP partition..."
+echo "All partitions after APP will be shifted by $SECTORS_TO_ADD sectors"
+echo ""
+
+# Get list of all partitions from source, sorted by partition number
+PARTITIONS=$(sgdisk -p "$SOURCE" | grep -E "^ *[0-9]+" | awk '{print $1}' | sort -n)
+
+for PART_NUM in $PARTITIONS; do
+    # Get partition info from source
+    PART_INFO=$(sgdisk -i "$PART_NUM" "$SOURCE")
+    PART_START=$(echo "$PART_INFO" | grep "First sector:" | awk '{print $3}')
+    PART_END=$(echo "$PART_INFO" | grep "Last sector:" | awk '{print $3}')
+    PART_TYPE=$(echo "$PART_INFO" | grep "Partition GUID code:" | awk '{print $4}')
+    PART_NAME=$(echo "$PART_INFO" | grep "Partition name:" | sed "s/Partition name: '\(.*\)'/\1/")
+    
+    if [[ "$PART_NUM" -eq "$APP_PART_NUM" ]]; then
+        # This is the APP partition - create it with expanded size
+        NEW_START=$PART_START
+        NEW_END=$NEW_APP_END
+        echo "Creating partition $PART_NUM (APP - EXPANDED): start=$NEW_START, end=$NEW_END"
+    else
+        # This is another partition - shift it by the amount we expanded APP
+        NEW_START=$((PART_START + SECTORS_TO_ADD))
+        NEW_END=$((PART_END + SECTORS_TO_ADD))
+        echo "Creating partition $PART_NUM ($PART_NAME): start=$NEW_START, end=$NEW_END (shifted +$SECTORS_TO_ADD)"
+    fi
+    
+    # Create the partition
+    sgdisk -n "${PART_NUM}:${NEW_START}:${NEW_END}" \
+           -t "${PART_NUM}:${PART_TYPE}" \
+           -c "${PART_NUM}:${PART_NAME}" \
+           "$DESTINATION" || { echo "Failed to create partition $PART_NUM"; exit 1; }
+done
+
+echo ""
+echo "All partitions created successfully!"
 
 # Modify PARTUUIDs on destination disk
 echo "Randomizing GUIDs for $DESTINATION..."
 sgdisk --randomize-guids "$DESTINATION" || { echo "Failed to randomize GUIDs on $DESTINATION."; exit 1; }
 
-# Calculate and allocate 90% of unallocated space to APP partition
-echo "Calculating unallocated space and expanding APP partition..."
-
-# Get total disk size in sectors using blockdev (more reliable)
-TOTAL_SECTORS=$(blockdev --getsz "$DESTINATION")
-echo "Total disk sectors: $TOTAL_SECTORS"
-
-# First, we need to move the backup GPT to the end of the larger disk
+# Move backup GPT to end of disk
 echo "Moving backup GPT header to end of disk..."
 sgdisk -e "$DESTINATION" || echo "Warning: Could not move GPT backup header"
 
-# Get the last used sector from the partition table (this is the end of the last partition)
-LAST_USED_SECTOR=$(sgdisk -p "$DESTINATION" | grep -E "^ *[0-9]+" | awk '{print $3}' | sort -n | tail -1)
-echo "Last used sector: $LAST_USED_SECTOR"
-
-# Find which partition number ends at the last used sector (this is the expandable partition)
-LAST_PART_NUM=$(sgdisk -p "$DESTINATION" | grep -E "^ *[0-9]+" | awk -v last="$LAST_USED_SECTOR" '$3 == last {print $1}')
-echo "Last partition number (expandable): $LAST_PART_NUM"
-
-# Calculate unallocated sectors (reserve 34 sectors for backup GPT at the end)
-UNALLOCATED_SECTORS=$((TOTAL_SECTORS - LAST_USED_SECTOR - 34))
-echo "Unallocated sectors: $UNALLOCATED_SECTORS"
-
-if [[ $UNALLOCATED_SECTORS -gt 1000000 ]] && [[ -n "$LAST_PART_NUM" ]]; then
-    # Calculate 90% of unallocated space
-    SECTORS_TO_ADD=$((UNALLOCATED_SECTORS * 90 / 100))
-    echo "Sectors to add to partition $LAST_PART_NUM (90% of unallocated): $SECTORS_TO_ADD"
-    
-    # Get current start and end sector of the last partition on DESTINATION
-    PART_INFO=$(sgdisk -i "$LAST_PART_NUM" "$DESTINATION")
-    PART_START=$(echo "$PART_INFO" | grep "First sector:" | awk '{print $3}')
-    CURRENT_END=$(echo "$PART_INFO" | grep "Last sector:" | awk '{print $3}')
-    PART_NAME=$(echo "$PART_INFO" | grep "Partition name:" | sed "s/Partition name: '\(.*\)'/\1/")
-    echo "Partition $LAST_PART_NUM ('$PART_NAME'): start=$PART_START, end=$CURRENT_END"
-    
-    # Check if this is the APP partition - if not, warn the user
-    if [[ "$PART_NAME" != "APP" ]]; then
-        echo ""
-        echo "NOTE: The last partition is '$PART_NAME', not 'APP'."
-        echo "      On Jetson, the APP partition is typically not the last partition."
-        echo "      The unallocated space will be added to partition $LAST_PART_NUM ('$PART_NAME')."
-        echo ""
-        echo "      If you want to expand the APP partition instead, you would need to"
-        echo "      manually rearrange the partition layout, which is complex and risky."
-        echo ""
-        read -p "Do you want to expand partition $LAST_PART_NUM ('$PART_NAME') instead? (y/N): " EXPAND_CONFIRM
-        if [[ "$EXPAND_CONFIRM" != "y" && "$EXPAND_CONFIRM" != "Y" ]]; then
-            echo "Skipping partition expansion. You can manually resize later."
-            SECTORS_TO_ADD=0
-        fi
-    fi
-    
-    if [[ $SECTORS_TO_ADD -gt 0 ]]; then
-        # Calculate new end sector
-        NEW_END=$((CURRENT_END + SECTORS_TO_ADD))
-        
-        # Make sure we don't exceed disk size (leave 34 sectors for backup GPT)
-        MAX_END=$((TOTAL_SECTORS - 34))
-        if [[ $NEW_END -gt $MAX_END ]]; then
-            NEW_END=$MAX_END
-        fi
-        
-        echo "Expanding partition $LAST_PART_NUM using sfdisk..."
-        echo "  Start: $PART_START (unchanged), End: $NEW_END (was $CURRENT_END)"
-        
-        # Use sfdisk to resize the partition in place
-        echo ", +${SECTORS_TO_ADD}" | sfdisk --no-reread -N "$LAST_PART_NUM" "$DESTINATION" 2>/dev/null || {
-            echo "sfdisk resize failed, trying alternative method with parted..."
-            parted -s "$DESTINATION" resizepart "$LAST_PART_NUM" "${NEW_END}s" || {
-                echo "Warning: Failed to expand partition $LAST_PART_NUM. Continuing without expansion."
-                echo "You can manually resize the partition later using GParted or similar tools."
-            }
-        }
-        
-        # Calculate actual expansion
-        ACTUAL_EXPANSION=$((NEW_END - CURRENT_END))
-        EXPANSION_GB=$((ACTUAL_EXPANSION * 512 / 1024 / 1024 / 1024))
-        echo "Successfully expanded partition $LAST_PART_NUM by $ACTUAL_EXPANSION sectors (~${EXPANSION_GB} GB)"
-        
-        # Verify the change
-        echo "Verifying partition $LAST_PART_NUM on $DESTINATION:"
-        sgdisk -i "$LAST_PART_NUM" "$DESTINATION" | grep -E "(First sector|Last sector|Partition size)"
-    fi
-else
-    if [[ -z "$LAST_PART_NUM" ]]; then
-        echo "Could not determine the last partition. Skipping expansion."
-    else
-        echo "Unallocated space is less than ~500MB. Skipping partition expansion."
-    fi
-fi
+# Store expansion info for later display
+ACTUAL_EXPANSION=$SECTORS_TO_ADD
+EXPANSION_GB=$EXTRA_GB
 
 echo "Flushing disk writes..."
 sync
@@ -305,14 +298,11 @@ echo "Summary:"
 sgdisk -p "$DESTINATION"
 echo ""
 if [[ ${ACTUAL_EXPANSION:-0} -gt 0 ]]; then
-    echo "✓ Partition $LAST_PART_NUM ('$PART_NAME') was automatically expanded"
-    echo "  by ~${EXPANSION_GB}GB (90% of unallocated space)"
+    echo "✓ APP partition (partition $APP_PART_NUM) was expanded by ~${EXPANSION_GB:-0}GB"
+    echo "  All other partitions were shifted to accommodate the larger APP"
     echo ""
 fi
 echo "Next step: Run copy_partitions.sh to clone the data"
 echo "=========================================="
-
-# Clean up
-rm -f table.bak
 
 echo "Partition cloning, file system replication, and UUID adjustment complete."
