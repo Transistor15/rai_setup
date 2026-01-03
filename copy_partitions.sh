@@ -152,22 +152,50 @@ for SOURCE_PART in $SOURCE_PARTS; do
             echo "Error: Failed to sync root filesystem directories from $SOURCE_PART to $DEST_PART."
         }
         sync
+        
+        # Unmount before resizing
+        umount "$DEST_MOUNT"
+        
+        # Expand the filesystem to fill the partition
+        echo "Expanding ext4 filesystem on $DEST_PART to fill partition..."
+        e2fsck -fy "$DEST_PART" || echo "Warning: Filesystem check had errors, attempting resize anyway..."
+        resize2fs "$DEST_PART" && echo "Successfully expanded filesystem on $DEST_PART"
+        
+        # Remount to verify
+        mount "$DEST_PART" "$DEST_MOUNT"
+        DEST_FS_SIZE=$(df -h "$DEST_MOUNT" | tail -1 | awk '{print $2}')
+        echo "New filesystem size: $DEST_FS_SIZE"
+        umount "$DEST_MOUNT"
+        
     elif [[ "$SRC_MOUNT" == "/boot" ]]; then
         echo "Detected boot partition. Copying all boot files."
         rsync -aAXv --progress "$SRC_MOUNT/" "$DEST_MOUNT/" || {
             echo "Error: Failed to sync boot partition from $SOURCE_PART to $DEST_PART."
         }
         sync
-    else
-        # General rsync for non-root partitions
+        umount "$DEST_MOUNT"
+    elif [[ "$SRC_FSTYPE" == "ext4" ]]; then
+        # General ext4 partitions - also resize them if expanded
         rsync -aAXv --progress "$SRC_MOUNT/" "$DEST_MOUNT/" || {
             echo "Error: Failed to sync $SOURCE_PART to $DEST_PART."
         }
         sync
+        
+        # Unmount and resize
+        umount "$DEST_MOUNT"
+        echo "Checking and expanding ext4 filesystem on $DEST_PART if needed..."
+        e2fsck -fy "$DEST_PART" || echo "Warning: Filesystem check had errors."
+        resize2fs "$DEST_PART" && echo "Filesystem on $DEST_PART expanded to fill partition."
+    else
+        # General rsync for non-ext4 partitions
+        rsync -aAXv --progress "$SRC_MOUNT/" "$DEST_MOUNT/" || {
+            echo "Error: Failed to sync $SOURCE_PART to $DEST_PART."
+        }
+        sync
+        umount "$DEST_MOUNT"
     fi
 
-    # Unmount destination and source (only if the source was mounted by the script)
-    umount "$DEST_MOUNT"
+    # Remove mount point
     rmdir "$DEST_MOUNT"
     if [[ -z "$SRC_MOUNTPOINT" ]]; then
         umount "$SRC_MOUNT"

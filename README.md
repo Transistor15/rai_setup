@@ -10,8 +10,8 @@ I'm using the 2280 slot for the SSD. The 2230 slot is also on /dev/nvme0n1 if yo
 
 ## Features
 This is a three step process:
-- **Partition Copying**: Copy the partition structure from the SD card to the SSD.
-- **Data Cloning**: Clone data from the SD card partitions to the SSD partitions.
+- **Partition Copying**: Copy the partition structure from the SD card to the SSD and automatically expand the APP (root) partition to utilize 90% of available unallocated space.
+- **Data Cloning**: Clone data from the SD card partitions to the SSD partitions and expand filesystems to match partition sizes.
 - **Boot Configuration**: Modify system files to enable the Jetson Developer Kit to boot from the SSD.
 
 ## Requirements
@@ -24,10 +24,10 @@ This is a three step process:
 
 ## Included Scripts
 ### 1. `make_partitions.sh`
-This script copies the partition structure from the SD card to the SSD.
+This script copies the partition structure from the SD card to the SSD. It automatically detects unallocated space and expands the APP (root) partition to use 90% of the available unallocated space, maximizing usable storage while maintaining the same partition structure.
 
 ### 2. `copy_partitions.sh`
-This script copies the data from the SD card partitions to the corresponding SSD partitions.
+This script copies the data from the SD card partitions to the corresponding SSD partitions. For ext4 filesystems, it automatically expands them to fill their partitions after copying, ensuring the full partition size is available for use.
 
 ### 3. `configure_ssd_boot.sh`
 This script modifies system configuration files on the SSD to enable the Jetson Developer Kit to boot from the SSD. It updates:
@@ -52,7 +52,9 @@ sudo bash configure_ssd_boot.sh
 ```
 
 ## Notes
-- Ensure the SSD has a larger capacity than the SD card.
+- The SSD should have a larger capacity than the SD card to benefit from automatic APP partition expansion.
+- The APP partition will be automatically expanded to use 90% of unallocated space (reserving 10% for over-provisioning and future flexibility).
+- The filesystem expansion happens automatically during the data copy step.
 - Back up your data before running the scripts.
 - After completing all steps, reboot the Jetson Developer Kit to verify that it boots from the SSD. (You may have to change the boot order in the UEFI boot sequence).
 
