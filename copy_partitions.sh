@@ -48,6 +48,11 @@ fi
 # Confirm the operation with the user
 echo "Source disk: $SOURCE"
 echo "Destination disk: $DESTINATION"
+echo ""
+echo "NOTE: This script copies data from source partitions to destination partitions."
+echo "      The APP partition on destination may be larger than source (if expanded)."
+echo "      The filesystem will be automatically resized to use the full partition."
+echo ""
 read -p "Are you sure you want to copy contents from $SOURCE to $DESTINATION? (y/N): " CONFIRM
 if [[ "$CONFIRM" != "y" && "$CONFIRM" != "Y" ]]; then
     echo "Operation cancelled."
@@ -90,8 +95,19 @@ for SOURCE_PART in $SOURCE_PARTS; do
     # Identify the file system on the source and destination partitions
     SRC_FSTYPE=$(blkid -o value -s TYPE "$SOURCE_PART")
     DEST_FSTYPE=$(blkid -o value -s TYPE "$DEST_PART" || echo "")
+    
+    # Get partition sizes for comparison
+    SRC_SIZE=$(blockdev --getsize64 "$SOURCE_PART" 2>/dev/null || echo "0")
+    DEST_SIZE=$(blockdev --getsize64 "$DEST_PART" 2>/dev/null || echo "0")
+    SRC_SIZE_MB=$((SRC_SIZE / 1024 / 1024))
+    DEST_SIZE_MB=$((DEST_SIZE / 1024 / 1024))
 
-    echo "Checking filesystem compatibility from $SOURCE_PART ($SRC_FSTYPE) to $DEST_PART ($DEST_FSTYPE)..."
+    echo "Partition $PART_NUM: Source=${SRC_SIZE_MB}MB, Dest=${DEST_SIZE_MB}MB, FS=${SRC_FSTYPE:-raw}"
+    
+    if [[ $DEST_SIZE -gt $SRC_SIZE ]]; then
+        EXTRA_MB=$(((DEST_SIZE - SRC_SIZE) / 1024 / 1024))
+        echo "  -> Destination is ${EXTRA_MB}MB larger (will be used after filesystem resize)"
+    fi
 
     # Handle partitions without a filesystem (raw partitions)
     if [[ -z "$SRC_FSTYPE" ]]; then
@@ -209,5 +225,35 @@ sync
 blockdev --flushbufs "$DESTINATION"
 udevadm settle
 
+# Show final summary
+echo ""
+echo "=========================================="
+echo "Partition content copy complete!"
+echo "=========================================="
 
-echo "Partition content copy complete."
+# Check APP partition (partition 1) final size
+APP_PART="${DESTINATION}p1"
+if [[ -b "$APP_PART" ]]; then
+    APP_FS_TYPE=$(blkid -o value -s TYPE "$APP_PART")
+    if [[ "$APP_FS_TYPE" == "ext4" ]]; then
+        # Mount temporarily to check size
+        TMP_MOUNT="/mnt/app_check_$$"
+        mkdir -p "$TMP_MOUNT"
+        if mount -o ro "$APP_PART" "$TMP_MOUNT" 2>/dev/null; then
+            APP_SIZE=$(df -h "$TMP_MOUNT" | tail -1 | awk '{print $2}')
+            APP_USED=$(df -h "$TMP_MOUNT" | tail -1 | awk '{print $3}')
+            APP_AVAIL=$(df -h "$TMP_MOUNT" | tail -1 | awk '{print $4}')
+            echo ""
+            echo "APP partition (root filesystem):"
+            echo "  Total size: $APP_SIZE"
+            echo "  Used: $APP_USED"
+            echo "  Available: $APP_AVAIL"
+            umount "$TMP_MOUNT"
+        fi
+        rmdir "$TMP_MOUNT" 2>/dev/null
+    fi
+fi
+
+echo ""
+echo "Next step: Run configure_ssd_boot.sh to configure boot from SSD"
+echo "=========================================="
